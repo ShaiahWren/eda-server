@@ -13,7 +13,6 @@
 #  limitations under the License.
 import logging
 
-import redis
 from ansible_base.rbac.api.related import check_related_permissions
 from ansible_base.rbac.models import RoleDefinition
 from django.db import transaction
@@ -41,8 +40,6 @@ from aap_eda.tasks.orchestrator import (
     stop_rulebook_process,
 )
 
-from .mixins import RedisDependencyMixin
-
 logger = logging.getLogger(__name__)
 
 resource_name = "RulebookActivation"
@@ -51,7 +48,6 @@ resource_name = "RulebookActivation"
 class ActivationViewSet(
     mixins.DestroyModelMixin,
     viewsets.GenericViewSet,
-    RedisDependencyMixin,
 ):
     queryset = models.Activation.objects.all()
     filter_backends = (defaultfilters.DjangoFilterBackend,)
@@ -84,20 +80,11 @@ class ActivationViewSet(
             status.HTTP_400_BAD_REQUEST: OpenApiResponse(
                 description="Invalid data to create activation."
             ),
-        }
-        | RedisDependencyMixin.redis_unavailable_response(),
+        },
     )
     def create(self, request):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
-        # If we're expected to run this activation we need redis
-        # to be available.
-        if serializer.validated_data.get(
-            "is_enabled",
-            models.activation.DEFAULT_ENABLED,
-        ):
-            self.redis_is_available()
 
         with transaction.atomic():
             response = serializer.create(serializer.validated_data)
@@ -208,8 +195,7 @@ class ActivationViewSet(
                 None,
                 description="The Activation has been deleted.",
             ),
-        }
-        | RedisDependencyMixin.redis_unavailable_response(),
+        },
     )
     def destroy(self, request, *args, **kwargs):
         activation = self.get_object()
@@ -228,24 +214,18 @@ class ActivationViewSet(
             activation.organization,
         )
 
-        try:
-            with transaction.atomic():
-                activation.status = ActivationStatus.DELETING
-                activation.save(update_fields=["status"])
-                name = activation.name
+        with transaction.atomic():
+            activation.status = ActivationStatus.DELETING
+            activation.save(update_fields=["status"])
+            name = activation.name
 
-                request_id = request.headers.get("x-request-id", "")
-                delete_rulebook_process(
-                    process_parent_type=ProcessParentType.ACTIVATION,
-                    process_parent_id=activation.id,
-                    request_id=request_id,
-                )
-                logger.info(f"Now deleting {name} ...")
-        except redis.ConnectionError:
-            # If Redis isn't available we'll generate a Conflict (409).
-            # Anything else we re-raise the exception.
-            self.redis_is_available()
-            raise
+            request_id = request.headers.get("x-request-id", "")
+            delete_rulebook_process(
+                process_parent_type=ProcessParentType.ACTIVATION,
+                process_parent_id=activation.id,
+                request_id=request_id,
+            )
+            logger.info(f"Now deleting {name} ...")
 
         logger.info(audit_log)
 
@@ -392,9 +372,6 @@ class ActivationViewSet(
                 {"errors": error}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Redis must be available in order to perform the enable.
-        self.redis_is_available()
-
         logger.info(f"Now enabling {activation.name} ...")
 
         activation.is_enabled = True
@@ -436,8 +413,7 @@ class ActivationViewSet(
                 None,
                 description="Activation has been disabled.",
             ),
-        }
-        | RedisDependencyMixin.redis_unavailable_response(),
+        },
     )
     @action(methods=["post"], detail=True, rbac_action=Action.DISABLE)
     def disable(self, request, pk):
@@ -446,9 +422,6 @@ class ActivationViewSet(
         self._check_deleting(activation)
 
         if activation.is_enabled:
-            # Redis must be available in order to perform the delete.
-            self.redis_is_available()
-
             activation.status = ActivationStatus.STOPPING
             activation.is_enabled = False
             activation.save(
@@ -484,8 +457,7 @@ class ActivationViewSet(
                 None,
                 description="Activation not enabled.",
             ),
-        }
-        | RedisDependencyMixin.redis_unavailable_response(),
+        },
     )
     @action(methods=["post"], detail=True, rbac_action=Action.RESTART)
     def restart(self, request, pk):
@@ -497,9 +469,6 @@ class ActivationViewSet(
             raise api_exc.Forbidden(
                 detail="Activation is disabled and cannot be run."
             )
-
-        # Redis must be available in order to perform the restart.
-        self.redis_is_available()
 
         valid, error = is_activation_valid(activation)
         request_id = request.headers.get("x-request-id", "")
